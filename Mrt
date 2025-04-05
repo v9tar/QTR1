@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+import os
+import sys
+import time
+import json
+import random
+import string
+import asyncio
+import argparse
+import itertools
+import logging
+import signal
+from pathlib import Path
+from urllib.parse import urlparse
+
+import aiohttp
+from aiohttp_socks import ProxyConnector
+from fake_useragent import UserAgent
+
+# إعدادات الأداء القصوى
+MAX_CONCURRENT_TASKS = 1000
+REQUEST_TIMEOUT = 15
+BASE_DIR = Path(__file__).parent
+
+class TurboUsernameHunter:
+    def __init__(self):
+        self._init_directories()
+        self.config = self._load_config()
+        self.ua = UserAgent(browsers=['chrome', 'firefox', 'safari'])
+        self.proxy_pool = self._init_proxies()
+        self.session = None
+        self.stats = {
+            'checked': 0,
+            'available': 0,
+            'errors': 0,
+            'start_time': time.time()
+        }
+
+    def _init_directories(self):
+        (BASE_DIR / 'data').mkdir(exist_ok=True)
+        (BASE_DIR / 'logs').mkdir(exist_ok=True)
+
+    def _load_config(self):
+        config_path = BASE_DIR / 'config.json'
+        if not config_path.exists():
+            self._generate_default_config()
+        with open(config_path) as f:
+            return json.load(f)
+
+    def _generate_default_config(self):
+        default_config = {
+            "pattern": "user",
+            "min_length": 3,
+            "max_length": 5,
+            "proxy_file": "proxies.txt",
+            "max_retries": 3,
+            "request_timeout": 10,
+            "rate_limit": 0.01
+        }
+        with open(BASE_DIR / 'config.json', 'w') as f:
+            json.dump(default_config, f, indent=2)
+
+    def _init_proxies(self):
+        proxy_file = BASE_DIR / self.config['proxy_file']
+        if proxy_file.exists():
+            with open(proxy_file) as f:
+                return [line.strip() for line in f if line.strip()]
+        return []
+
+    async def generate_usernames(self):
+        chars = string.ascii_lowercase + string.digits + '_'
+        pattern = self.config['pattern'].lower()
+        for length in range(self.config['min_length'], self.config['max_length'] + 1):
+            for combo in itertools.product(chars, repeat=length):
+                username = ''.join(combo)
+                if pattern in username:
+                    yield username
+
+    async def check_username(self, username):
+        url = f"https://www.instagram.com/{username}/"
+        headers = {
+            'User-Agent': self.ua.random,
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+        
+        for attempt in range(self.config['max_retries'] + 1):
+            try:
+                async with self.session.get(
+                    url,
+                    headers=headers,
+                    proxy=random.choice(self.proxy_pool) if self.proxy_pool else None,
+                    timeout=REQUEST_TIMEOUT
+                ) as response:
+                    self.stats['checked'] += 1
+                    
+                    if response.status == 404:
+                        self.stats['available'] += 1
+                        await self.save_result(username)
+                        logging.info(f"✅ Available: {username}")
+                        return True
+                    elif response.status == 200:
+                        logging.debug(f"❌ Taken: {username}")
+                        return False
+                    elif response.status in (429, 503):
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        logging.warning(f"⚠️ Unexpected status: {response.status}")
+                        return False
+            except Exception as e:
+                self.stats['errors'] += 1
+                logging.error(f"⚠️ Error: {str(e)[:50]}")
+                await asyncio.sleep(1)
+        return False
+
+    async def save_result(self, username):
+        result_file = BASE_DIR / 'data' / 'available.txt'
+        async with aiohttp.Lock():
+            with open(result_file, 'a') as f:
+                f.write(f"{username}\n")
+
+    async def start(self):
+        connector = ProxyConnector(limit=MAX_CONCURRENT_TASKS)
+        self.session = aiohttp.ClientSession(connector=connector)
+        
+        tasks = set()
+        async for username in self.generate_usernames():
+            if len(tasks) >= MAX_CONCURRENT_TASKS:
+                _, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            tasks.add(asyncio.create_task(self.check_username(username)))
+            await asyncio.sleep(self.config['rate_limit'])
+        
+        await asyncio.gather(*tasks)
+        await self.session.close()
+        self.show_final_report()
+
+    def show_final_report(self):
+        elapsed = time.time() - self.stats['start_time']
+        speed = self.stats['checked'] / elapsed if elapsed > 0 else 0
+        report = (
+            f"\n🔥 Final Report:\n"
+            f"⏱️ Elapsed Time: {elapsed:.2f}s\n"
+            f"🚀 Check Speed: {speed:.2f}/s\n"
+            f"✅ Available: {self.stats['available']}\n"
+            f"🔄 Total Checked: {self.stats['checked']}\n"
+            f"⚠️ Errors: {self.stats['errors']}\n"
+        )
+        print(report)
+        logging.info(report)
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(BASE_DIR / 'logs' / 'activity.log'),
+            logging.StreamHandler()
+        ]
+    )
+
+    hunter = TurboUsernameHunter()
+    try:
+        asyncio.run(hunter.start())
+    except KeyboardInterrupt:
+        logging.info("\n🚨 Operation cancelled by user!")
